@@ -9,7 +9,7 @@ using LibreHardwareMonitor.Hardware;
 
 [assembly: System.Reflection.AssemblyTitle("DeepHibernate")]
 [assembly: System.Reflection.AssemblyDescription("极致休眠")]
-[assembly: System.Reflection.AssemblyVersion("2.1.0.0")]
+[assembly: System.Reflection.AssemblyVersion("2.2.0.0")]
 
 namespace DeepHibernate
 {
@@ -30,6 +30,13 @@ namespace DeepHibernate
         public double? GPU { get; set; }
     }
 
+    enum GpuType
+    {
+        Unknown,
+        Integrated,   // iGPU — 核显
+        Discrete      // dGPU — 独显
+    }
+
     class MainForm : Form
     {
         private CheckBox chkUSBSuspend;
@@ -40,6 +47,8 @@ namespace DeepHibernate
         private NumericUpDown numTemp;
         private Label lblCPU;
         private Label lblGPU;
+        private Label lblGPUType;
+        private Label lblFanStatus;
         private Label lblStatus;
         private Button btnHibernate;
         private BackgroundWorker coolDownWorker;
@@ -47,6 +56,10 @@ namespace DeepHibernate
 
         private Computer lhmComputer;
         private bool lhmAvailable = false;
+
+        private GpuType gpuType = GpuType.Unknown;
+        private bool fanControlSupported = false;
+        private bool fanBoosted = false;
 
         private int targetTemp = 35;
         private bool isCooling = false;
@@ -56,6 +69,8 @@ namespace DeepHibernate
         {
             InitializeComponent();
             InitLibreHardwareMonitor();
+            DetectGPUType();
+            DetectFanControl();
             ReadTemperatureAsync();
         }
 
@@ -75,10 +90,218 @@ namespace DeepHibernate
             }
         }
 
+        // =====================================================
+        // GPU Type Detection: iGPU vs dGPU
+        // =====================================================
+        private void DetectGPUType()
+        {
+            try
+            {
+                // Priority 1: LHM hardware type
+                if (lhmAvailable && lhmComputer != null)
+                {
+                    foreach (var hardware in lhmComputer.Hardware)
+                    {
+                        try { hardware.Update(); } catch { continue; }
+
+                        if (hardware.HardwareType == HardwareType.GpuIntel)
+                        {
+                            gpuType = GpuType.Integrated;
+                            return;
+                        }
+                        if (hardware.HardwareType == HardwareType.GpuNvidia)
+                        {
+                            gpuType = GpuType.Discrete;
+                            return;
+                        }
+                        if (hardware.HardwareType == HardwareType.GpuAmd)
+                        {
+                            // AMD can be APU (iGPU) or discrete — check name
+                            string name = hardware.Name.ToLower();
+                            if (name.Contains("radeon") && !name.Contains("vega") &&
+                                !name.Contains("apu"))
+                            {
+                                gpuType = GpuType.Discrete;
+                            }
+                            else
+                            {
+                                gpuType = GpuType.Integrated;
+                            }
+                            return;
+                        }
+                    }
+                }
+
+                // Priority 2: WMI fallback
+                using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
+                    "SELECT Name, AdapterRAM FROM Win32_VideoController"))
+                {
+                    foreach (ManagementObject obj in searcher.Get())
+                    {
+                        string name = (obj["Name"] ?? "").ToString().ToLower();
+                        object ramObj = obj["AdapterRAM"];
+
+                        // NVIDIA is always discrete
+                        if (name.Contains("nvidia") || name.Contains("geforce") ||
+                            name.Contains("quadro") || name.Contains("rtx") ||
+                            name.Contains("gtx"))
+                        {
+                            gpuType = GpuType.Discrete;
+                            return;
+                        }
+
+                        // Intel is always integrated
+                        if (name.Contains("intel") && (name.Contains("hd graphics") ||
+                            name.Contains("uhd graphics") || name.Contains("iris") ||
+                            name.Contains("arc")))
+                        {
+                            gpuType = GpuType.Integrated;
+                            return;
+                        }
+
+                        // AMD: check VRAM size — dGPU typically has > 512MB dedicated
+                        if (name.Contains("amd") || name.Contains("radeon"))
+                        {
+                            if (ramObj != null)
+                            {
+                                long ramBytes = Convert.ToInt64(ramObj);
+                                if (ramBytes > 536870912) // > 512 MB
+                                {
+                                    gpuType = GpuType.Discrete;
+                                }
+                                else
+                                {
+                                    gpuType = GpuType.Integrated;
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            gpuType = GpuType.Unknown;
+        }
+
+        // =====================================================
+        // Fan Control Detection
+        // =====================================================
+        private void DetectFanControl()
+        {
+            fanControlSupported = false;
+
+            try
+            {
+                // Try WMI Win32_Fan — most consumer boards don't support write
+                using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
+                    @"root\cimv2", "SELECT * FROM Win32_Fan"))
+                {
+                    foreach (ManagementObject obj in searcher.Get())
+                    {
+                        // Win32_Fan is mostly read-only; check if DesiredSpeed property exists
+                        if (obj.Properties["DesiredSpeed"] != null)
+                        {
+                            fanControlSupported = true;
+                            return;
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            try
+            {
+                // Try LHM fan control sensors
+                if (lhmAvailable && lhmComputer != null)
+                {
+                    foreach (var hardware in lhmComputer.Hardware)
+                    {
+                        try { hardware.Update(); } catch { continue; }
+
+                        foreach (var sensor in hardware.Sensors)
+                        {
+                            if (sensor.SensorType == SensorType.Control &&
+                                sensor.Name.ToLower().Contains("fan"))
+                            {
+                                fanControlSupported = true;
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            fanControlSupported = false;
+        }
+
+        // =====================================================
+        // Fan Speed Control Methods
+        // =====================================================
+        private void SetFanSpeedMax()
+        {
+            if (!fanControlSupported) return;
+
+            try
+            {
+                // Attempt via WMI
+                using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
+                    @"root\cimv2", "SELECT * FROM Win32_Fan"))
+                {
+                    foreach (ManagementObject obj in searcher.Get())
+                    {
+                        try
+                        {
+                            ManagementBaseObject inParams =
+                                obj.GetMethodParameters("SetSpeed");
+                            if (inParams != null)
+                            {
+                                inParams["DesiredSpeed"] = 100;
+                                obj.InvokeMethod("SetSpeed", inParams, null);
+                                fanBoosted = true;
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private void ResetFanSpeed()
+        {
+            if (!fanControlSupported || !fanBoosted) return;
+
+            try
+            {
+                using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
+                    @"root\cimv2", "SELECT * FROM Win32_Fan"))
+                {
+                    foreach (ManagementObject obj in searcher.Get())
+                    {
+                        try
+                        {
+                            ManagementBaseObject inParams =
+                                obj.GetMethodParameters("SetSpeed");
+                            if (inParams != null)
+                            {
+                                inParams["DesiredSpeed"] = 0; // 0 = auto / default
+                                obj.InvokeMethod("SetSpeed", inParams, null);
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                fanBoosted = false;
+            }
+            catch { }
+        }
+
         private void InitializeComponent()
         {
             this.Text = "DeepHibernate — 极致休眠";
-            this.Size = new Size(500, 460);
+            this.Size = new Size(500, 510);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
             this.MaximizeBox = false;
@@ -209,7 +432,27 @@ namespace DeepHibernate
             lblGPU.Location = new Point(leftMargin, y);
             lblGPU.Size = new Size(440, 22);
             this.Controls.Add(lblGPU);
-            y += 28;
+            y += 20;
+
+            // GPU Type indicator
+            lblGPUType = new Label();
+            lblGPUType.Text = "";
+            lblGPUType.Font = new Font("Microsoft YaHei", 8);
+            lblGPUType.ForeColor = Color.Gray;
+            lblGPUType.Location = new Point(leftMargin, y);
+            lblGPUType.Size = new Size(440, 14);
+            this.Controls.Add(lblGPUType);
+            y += 18;
+
+            // Fan status indicator
+            lblFanStatus = new Label();
+            lblFanStatus.Text = "";
+            lblFanStatus.Font = new Font("Microsoft YaHei", 8);
+            lblFanStatus.ForeColor = Color.Gray;
+            lblFanStatus.Location = new Point(leftMargin, y);
+            lblFanStatus.Size = new Size(440, 14);
+            this.Controls.Add(lblFanStatus);
+            y += 22;
 
             // Status
             lblStatus = new Label();
@@ -233,7 +476,7 @@ namespace DeepHibernate
 
             // Version
             Label lblVersion = new Label();
-            lblVersion.Text = "v2.1";
+            lblVersion.Text = "v2.2";
             lblVersion.Font = new Font("Microsoft YaHei", 8);
             lblVersion.ForeColor = Color.LightGray;
             lblVersion.Location = new Point(leftMargin, y);
@@ -306,10 +549,35 @@ namespace DeepHibernate
             // Switch to High Performance for active cooling
             SetHighPerformance();
 
-            lblStatus.Text = string.Format("正在降温... 等待温度降至 {0}°C", targetTemp);
+            // Boost fan speed if supported
+            SetFanSpeedMax();
+
+            string gpuLabel = GetGpuTypeLabel();
+            if (gpuType == GpuType.Integrated)
+            {
+                lblStatus.Text = string.Format(
+                    "正在降温 [{0}]... 等待 GPU 温度降至 {1}°C",
+                    gpuLabel, targetTemp);
+            }
+            else
+            {
+                lblStatus.Text = string.Format(
+                    "正在降温 [{0}]... 等待 CPU + GPU 温度降至 {1}°C",
+                    gpuLabel, targetTemp);
+            }
             lblStatus.ForeColor = Color.FromArgb(220, 120, 0);
 
             coolDownWorker.RunWorkerAsync();
+        }
+
+        private string GetGpuTypeLabel()
+        {
+            switch (gpuType)
+            {
+                case GpuType.Integrated: return "核显";
+                case GpuType.Discrete: return "独显";
+                default: return "未知GPU";
+            }
         }
 
         private void ApplyPowerPolicies()
@@ -409,17 +677,56 @@ namespace DeepHibernate
                 this.BeginInvoke((Action)(() =>
                 {
                     UpdateTempLabels(cpu, gpu);
+                    UpdateGPUTypeLabel();
+                    UpdateFanStatusLabel();
                 }));
             });
             t.IsBackground = true;
             t.Start();
         }
 
+        private void UpdateGPUTypeLabel()
+        {
+            switch (gpuType)
+            {
+                case GpuType.Integrated:
+                    lblGPUType.Text = "检测到：核显 (iGPU) — 休眠条件：仅 GPU 温度达标";
+                    break;
+                case GpuType.Discrete:
+                    lblGPUType.Text = "检测到：独显 (dGPU) — 休眠条件：CPU + GPU 温度均达标";
+                    break;
+                default:
+                    lblGPUType.Text = "未检测到 GPU 或类型未知，将使用 CPU 温度判断";
+                    break;
+            }
+        }
+
+        private void UpdateFanStatusLabel()
+        {
+            if (fanControlSupported)
+            {
+                lblFanStatus.Text = "风扇控制：已就绪，降温时将自动拉高转速";
+                lblFanStatus.ForeColor = Color.FromArgb(0, 140, 60);
+            }
+            else
+            {
+                lblFanStatus.Text = "风扇控制：不可用（系统不支持软件调速，将依赖被动降温）";
+                lblFanStatus.ForeColor = Color.FromArgb(180, 120, 0);
+            }
+        }
+
+        // =====================================================
+        // CoolDown Worker — conditional logic based on GPU type
+        // =====================================================
         private void CoolDownWorker_DoWork(object sender, DoWorkEventArgs e)
         {
             BackgroundWorker worker = sender as BackgroundWorker;
             DateTime start = DateTime.Now;
             TimeSpan timeout = TimeSpan.FromMinutes(10);
+
+            // Determine which sensors must be checked based on GPU type
+            bool needCPU = (gpuType == GpuType.Discrete || gpuType == GpuType.Unknown);
+            bool needGPU = (gpuType == GpuType.Integrated || gpuType == GpuType.Discrete);
 
             while (!worker.CancellationPending)
             {
@@ -431,8 +738,8 @@ namespace DeepHibernate
                     return;
                 }
 
-                double cpuTemp = ReadCPUTemperature();
-                double? gpuTemp = ReadGPUTemperature();
+                double cpuTemp = needCPU ? ReadCPUTemperature() : 0;
+                double? gpuTemp = needGPU ? ReadGPUTemperature() : null;
 
                 // Report temps to UI
                 TempInfo info = new TempInfo();
@@ -440,8 +747,31 @@ namespace DeepHibernate
                 info.GPU = gpuTemp;
                 worker.ReportProgress((int)elapsed.TotalSeconds, info);
 
-                // Check if CPU temp is valid and at or below target
-                if (cpuTemp > 0 && cpuTemp <= targetTemp)
+                // ---- Conditional hibernate check ----
+                bool isReady = false;
+
+                if (gpuType == GpuType.Integrated)
+                {
+                    // 核显：仅需 GPU 温度达标
+                    if (gpuTemp.HasValue && gpuTemp.Value > 0 && gpuTemp.Value <= targetTemp)
+                        isReady = true;
+                }
+                else if (gpuType == GpuType.Discrete)
+                {
+                    // 独显：CPU + GPU 温度均达标
+                    bool cpuOK = (cpuTemp > 0 && cpuTemp <= targetTemp);
+                    bool gpuOK = (gpuTemp.HasValue && gpuTemp.Value > 0 && gpuTemp.Value <= targetTemp);
+                    if (cpuOK && gpuOK)
+                        isReady = true;
+                }
+                else
+                {
+                    // Unknown: fallback to CPU only (original behavior)
+                    if (cpuTemp > 0 && cpuTemp <= targetTemp)
+                        isReady = true;
+                }
+
+                if (isReady)
                 {
                     e.Result = "reached";
                     return;
@@ -461,14 +791,21 @@ namespace DeepHibernate
             int elapsedSec = e.ProgressPercentage;
             int min = elapsedSec / 60;
             int sec = elapsedSec % 60;
+
+            string gpuLabel = GetGpuTypeLabel();
+            string fanNote = fanBoosted ? " [风扇加速]" : "";
+
             lblStatus.Text = string.Format(
-                "降温中 [{0}:{1:D2}] — 目标 {2}°C",
-                min, sec, targetTemp);
+                "降温中 [{0}:{1:D2}] — 目标 {2}°C [{3}]{4}",
+                min, sec, targetTemp, gpuLabel, fanNote);
             lblStatus.ForeColor = Color.FromArgb(220, 120, 0);
         }
 
         private void CoolDownWorker_Completed(object sender, RunWorkerCompletedEventArgs e)
         {
+            // Restore fan to default
+            ResetFanSpeed();
+
             string result = e.Result as string;
 
             if (result == "reached")
@@ -499,6 +836,12 @@ namespace DeepHibernate
                 lblStatus.ForeColor = Color.Red;
                 isCooling = false;
                 btnHibernate.Enabled = true;
+                trackTemp.Enabled = true;
+                numTemp.Enabled = true;
+                chkUSBSuspend.Enabled = true;
+                chkDeviceWake.Enabled = true;
+                chkWOL.Enabled = true;
+                chkTaskWake.Enabled = true;
             }
         }
 
@@ -734,6 +1077,8 @@ namespace DeepHibernate
         {
             if (disposing)
             {
+                ResetFanSpeed();
+
                 if (tempTimer != null)
                 {
                     tempTimer.Stop();
