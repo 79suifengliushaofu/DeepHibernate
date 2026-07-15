@@ -1,5 +1,28 @@
 # DeepHibernate 更新日志
 
+## v2.0 (2026-07-15) — 重新编译
+
+### v2.0 经典 UI + 新特性
+
+- **保留 v2.0 四个选项框**：
+  - 关闭 USB 选择性暂停（默认勾选）
+  - 禁用设备唤醒权限（默认勾选）
+  - 关闭网卡 Wake-on-LAN（默认不勾选）
+  - 禁用计划任务唤醒（默认勾选）
+- **可自定义目标温度**：滑块 + 数字输入，20~80°C，默认 35°C
+- **实时双温度显示**：CPU（WMI MSAcpi_ThermalZoneTemperature）+ GPU（nvidia-smi），带颜色指示
+- **主动散热电源策略**：进入降温前自动切换高性能电源方案加速散热
+- **零依赖**：回归系统原生 API，20KB 单文件
+
+### 技术变更
+
+- 源码从 v1.0 重新编写：WinForms .NET Framework 4.x / C# 5
+- 新增 `System.Management.dll` 引用（WMI 温度查询）
+- 使用 `BackgroundWorker` 实现非阻塞降温循环
+- TrackBar + NumericUpDown 双向同步
+
+---
+
 ## v4.0 (2026-07-15)
 
 ### 极简化重构
