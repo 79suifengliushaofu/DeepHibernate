@@ -1,4 +1,3 @@
-
 using System;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -6,10 +5,11 @@ using System.Drawing;
 using System.Management;
 using System.Threading;
 using System.Windows.Forms;
+using LibreHardwareMonitor.Hardware;
 
 [assembly: System.Reflection.AssemblyTitle("DeepHibernate")]
 [assembly: System.Reflection.AssemblyDescription("极致休眠")]
-[assembly: System.Reflection.AssemblyVersion("2.0.0.0")]
+[assembly: System.Reflection.AssemblyVersion("2.1.0.0")]
 
 namespace DeepHibernate
 {
@@ -43,6 +43,10 @@ namespace DeepHibernate
         private Label lblStatus;
         private Button btnHibernate;
         private BackgroundWorker coolDownWorker;
+        private System.Windows.Forms.Timer tempTimer;
+
+        private Computer lhmComputer;
+        private bool lhmAvailable = false;
 
         private int targetTemp = 35;
         private bool isCooling = false;
@@ -51,7 +55,24 @@ namespace DeepHibernate
         public MainForm()
         {
             InitializeComponent();
+            InitLibreHardwareMonitor();
             ReadTemperatureAsync();
+        }
+
+        private void InitLibreHardwareMonitor()
+        {
+            try
+            {
+                lhmComputer = new Computer();
+                lhmComputer.IsCpuEnabled = true;
+                lhmComputer.IsGpuEnabled = true;
+                lhmComputer.Open();
+                lhmAvailable = true;
+            }
+            catch
+            {
+                lhmAvailable = false;
+            }
         }
 
         private void InitializeComponent()
@@ -212,7 +233,7 @@ namespace DeepHibernate
 
             // Version
             Label lblVersion = new Label();
-            lblVersion.Text = "v2.0";
+            lblVersion.Text = "v2.1";
             lblVersion.Font = new Font("Microsoft YaHei", 8);
             lblVersion.ForeColor = Color.LightGray;
             lblVersion.Location = new Point(leftMargin, y);
@@ -226,6 +247,26 @@ namespace DeepHibernate
             coolDownWorker.DoWork += CoolDownWorker_DoWork;
             coolDownWorker.ProgressChanged += CoolDownWorker_ProgressChanged;
             coolDownWorker.RunWorkerCompleted += CoolDownWorker_Completed;
+
+            // Temperature refresh timer (2 second interval)
+            tempTimer = new System.Windows.Forms.Timer();
+            tempTimer.Interval = 2000;
+            tempTimer.Tick += TempTimer_Tick;
+            tempTimer.Start();
+        }
+
+        private void TempTimer_Tick(object sender, EventArgs e)
+        {
+            // Read temps in background thread to avoid UI freeze
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                double cpu = ReadCPUTemperature();
+                double? gpu = ReadGPUTemperature();
+                this.BeginInvoke((Action)(() =>
+                {
+                    UpdateTempLabels(cpu, gpu);
+                }));
+            });
         }
 
         private void TrackTemp_Scroll(object sender, EventArgs e)
@@ -465,11 +506,7 @@ namespace DeepHibernate
         {
             if (cpuTemp > 0)
             {
-                lblCPU.Text = string.Format("CPU 温度：{0:F1} °C", cpuTemp);
-                if (cpuTemp > targetTemp)
-                    lblCPU.ForeColor = Color.FromArgb(200, 60, 0);
-                else
-                    lblCPU.ForeColor = Color.Green;
+                SetTempLabel(lblCPU, "CPU 温度", cpuTemp);
             }
             else
             {
@@ -477,13 +514,9 @@ namespace DeepHibernate
                 lblCPU.ForeColor = Color.Gray;
             }
 
-            if (gpuTemp.HasValue)
+            if (gpuTemp.HasValue && gpuTemp.Value > 0)
             {
-                lblGPU.Text = string.Format("GPU 温度：{0:F0} °C", gpuTemp.Value);
-                if (gpuTemp.Value > targetTemp)
-                    lblGPU.ForeColor = Color.FromArgb(200, 60, 0);
-                else
-                    lblGPU.ForeColor = Color.Green;
+                SetTempLabel(lblGPU, "GPU 温度", gpuTemp.Value);
             }
             else
             {
@@ -492,8 +525,38 @@ namespace DeepHibernate
             }
         }
 
+        private void SetTempLabel(Label lbl, string prefix, double temp)
+        {
+            lbl.Text = string.Format("{0}：{1:F0} °C", prefix, temp);
+
+            if (temp > 80)
+                lbl.ForeColor = Color.FromArgb(220, 30, 0);  // Hot red
+            else if (temp > 60)
+                lbl.ForeColor = Color.FromArgb(220, 120, 0); // Warm orange
+            else if (temp > targetTemp)
+                lbl.ForeColor = Color.FromArgb(200, 140, 0); // Mild yellow-orange
+            else
+                lbl.ForeColor = Color.FromArgb(0, 160, 60);  // Cool green
+        }
+
+        // =====================================================
+        // CPU Temperature: LHM → WMI MSAcpi → N/A
+        // =====================================================
         private double ReadCPUTemperature()
         {
+            // Priority 1: LibreHardwareMonitorLib (most reliable, all CPUs)
+            if (lhmAvailable && lhmComputer != null)
+            {
+                try
+                {
+                    double? lhmTemp = ReadCPUTempFromLHM();
+                    if (lhmTemp.HasValue && lhmTemp.Value > 0)
+                        return lhmTemp.Value;
+                }
+                catch { }
+            }
+
+            // Priority 2: WMI MSAcpi_ThermalZoneTemperature (fallback)
             try
             {
                 using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
@@ -504,33 +567,11 @@ namespace DeepHibernate
                         object tempObj = obj["CurrentTemperature"];
                         if (tempObj != null)
                         {
-                            // MSAcpi returns temperature in tenths of Kelvin
                             double kelvinTenths = Convert.ToDouble(tempObj);
                             double celsius = (kelvinTenths / 10.0) - 273.15;
-                            return celsius;
-                        }
-                    }
-                }
-            }
-            catch { }
-
-            // Fallback: try Win32_PerfFormattedData thermal zone
-            try
-            {
-                using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
-                    @"root\CIMV2",
-                    "SELECT * FROM Win32_PerfFormattedData_Counters_ThermalZoneInformation"))
-                {
-                    foreach (ManagementObject obj in searcher.Get())
-                    {
-                        object tempObj = obj["Temperature"];
-                        if (tempObj != null)
-                        {
-                            double celsius = Convert.ToDouble(tempObj);
-                            // Some systems report directly in Celsius
-                            if (celsius > 200)
-                                celsius = (celsius / 10.0) - 273.15;
-                            return celsius;
+                            // Sanity check: valid CPU temps are 0-125°C
+                            if (celsius >= 0 && celsius <= 125)
+                                return celsius;
                         }
                     }
                 }
@@ -540,8 +581,67 @@ namespace DeepHibernate
             return 0;
         }
 
+        private double? ReadCPUTempFromLHM()
+        {
+            if (lhmComputer == null) return null;
+
+            foreach (var hardware in lhmComputer.Hardware)
+            {
+                try { hardware.Update(); } catch { continue; }
+
+                // CPU hardware type
+                if (hardware.HardwareType == HardwareType.Cpu)
+                {
+                    // Prefer "CPU Package" or "Core (Tctl/Tdie)" — the package-level sensor
+                    foreach (var sensor in hardware.Sensors)
+                    {
+                        if (sensor.SensorType == SensorType.Temperature &&
+                            sensor.Value.HasValue &&
+                            sensor.Value > 0)
+                        {
+                            string name = sensor.Name.ToLower();
+                            if (name.Contains("package") || name.Contains("tdie") ||
+                                name.Contains("tctl") || name.Contains("cpu"))
+                            {
+                                return sensor.Value.Value;
+                            }
+                        }
+                    }
+
+                    // Fallback: any temperature sensor on CPU hardware
+                    foreach (var sensor in hardware.Sensors)
+                    {
+                        if (sensor.SensorType == SensorType.Temperature &&
+                            sensor.Value.HasValue &&
+                            sensor.Value > 0)
+                        {
+                            return sensor.Value.Value;
+                        }
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        // =====================================================
+        // GPU Temperature: LHM → nvidia-smi → N/A
+        // =====================================================
         private double? ReadGPUTemperature()
         {
+            // Priority 1: LibreHardwareMonitorLib (all GPUs: NVIDIA/AMD/Intel)
+            if (lhmAvailable && lhmComputer != null)
+            {
+                try
+                {
+                    double? lhmTemp = ReadGPUTempFromLHM();
+                    if (lhmTemp.HasValue && lhmTemp.Value > 0)
+                        return lhmTemp.Value;
+                }
+                catch { }
+            }
+
+            // Priority 2: nvidia-smi (NVIDIA dGPU fallback)
             try
             {
                 string nvidiaPath = null;
@@ -577,13 +677,74 @@ namespace DeepHibernate
                 if (p.ExitCode == 0 && output.Length > 0)
                 {
                     double temp;
-                    if (double.TryParse(output, out temp))
+                    if (double.TryParse(output, out temp) && temp > 0)
                         return temp;
                 }
             }
             catch { }
 
             return null;
+        }
+
+        private double? ReadGPUTempFromLHM()
+        {
+            if (lhmComputer == null) return null;
+
+            foreach (var hardware in lhmComputer.Hardware)
+            {
+                try { hardware.Update(); } catch { continue; }
+
+                // GPU hardware types: NvidiaGpu, AmdGpu, IntelGpu
+                if (hardware.HardwareType == HardwareType.GpuNvidia ||
+                    hardware.HardwareType == HardwareType.GpuAmd ||
+                    hardware.HardwareType == HardwareType.GpuIntel)
+                {
+                    // Prefer "GPU Core" temperature sensor
+                    foreach (var sensor in hardware.Sensors)
+                    {
+                        if (sensor.SensorType == SensorType.Temperature &&
+                            sensor.Value.HasValue &&
+                            sensor.Value > 0)
+                        {
+                            string name = sensor.Name.ToLower();
+                            if (name.Contains("core") || name.Contains("gpu"))
+                            {
+                                return sensor.Value.Value;
+                            }
+                        }
+                    }
+
+                    // Fallback: any temperature sensor on GPU hardware
+                    foreach (var sensor in hardware.Sensors)
+                    {
+                        if (sensor.SensorType == SensorType.Temperature &&
+                            sensor.Value.HasValue &&
+                            sensor.Value > 0)
+                        {
+                            return sensor.Value.Value;
+                        }
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (tempTimer != null)
+                {
+                    tempTimer.Stop();
+                    tempTimer.Dispose();
+                }
+                if (lhmComputer != null)
+                {
+                    try { lhmComputer.Close(); } catch { }
+                }
+            }
+            base.Dispose(disposing);
         }
     }
 }
