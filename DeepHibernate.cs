@@ -9,7 +9,7 @@ using LibreHardwareMonitor.Hardware;
 
 [assembly: System.Reflection.AssemblyTitle("DeepHibernate")]
 [assembly: System.Reflection.AssemblyDescription("极致休眠")]
-[assembly: System.Reflection.AssemblyVersion("2.2.0.0")]
+[assembly: System.Reflection.AssemblyVersion("2.3.0.0")]
 
 namespace DeepHibernate
 {
@@ -58,6 +58,8 @@ namespace DeepHibernate
         private bool lhmAvailable = false;
 
         private GpuType gpuType = GpuType.Unknown;
+        private enum FanControlMethod { None, NvidiaSMI, WMI }
+        private FanControlMethod fanMethod = FanControlMethod.None;
         private bool fanControlSupported = false;
         private bool fanBoosted = false;
 
@@ -92,12 +94,15 @@ namespace DeepHibernate
 
         // =====================================================
         // GPU Type Detection: iGPU vs dGPU
+        //   - 核显 (iGPU / Integrated): 共享系统内存，无专用显存或 AdapterRAM 很小
+        //   - 独显 (dGPU / Discrete): 有独立专用显存 (AdapterRAM > 1GB)
+        // LHM 检测 + WMI AdapterRAM 交叉验证，避免 AMD APU 被误判为独显
         // =====================================================
         private void DetectGPUType()
         {
             try
             {
-                // Priority 1: LHM hardware type
+                // Priority 1: LHM hardware type + WMI cross-validation for AMD
                 if (lhmAvailable && lhmComputer != null)
                 {
                     foreach (var hardware in lhmComputer.Hardware)
@@ -116,10 +121,11 @@ namespace DeepHibernate
                         }
                         if (hardware.HardwareType == HardwareType.GpuAmd)
                         {
-                            // AMD can be APU (iGPU) or discrete — check name
-                            string name = hardware.Name.ToLower();
-                            if (name.Contains("radeon") && !name.Contains("vega") &&
-                                !name.Contains("apu"))
+                            // AMD: cross-reference with WMI AdapterRAM for accurate classification
+                            // APU Radeon Graphics shares system memory → AdapterRAM is 0 or small
+                            // dGPU (RX / Pro / FirePro) has dedicated VRAM → AdapterRAM > 1GB
+                            long vram = GetAdapterRAMForGPU(hardware.Name);
+                            if (vram >= 536870912) // >= 512 MB dedicated VRAM
                             {
                                 gpuType = GpuType.Discrete;
                             }
@@ -132,51 +138,63 @@ namespace DeepHibernate
                     }
                 }
 
-                // Priority 2: WMI fallback
+                // Priority 2: WMI fallback — scan ALL adapters, not just the first
+                bool hasNvidia = false;
+                bool hasIntel = false;
+                long amdMaxVRAM = 0;
+
                 using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
                     "SELECT Name, AdapterRAM FROM Win32_VideoController"))
                 {
                     foreach (ManagementObject obj in searcher.Get())
                     {
                         string name = (obj["Name"] ?? "").ToString().ToLower();
-                        object ramObj = obj["AdapterRAM"];
 
-                        // NVIDIA is always discrete
                         if (name.Contains("nvidia") || name.Contains("geforce") ||
                             name.Contains("quadro") || name.Contains("rtx") ||
                             name.Contains("gtx"))
                         {
-                            gpuType = GpuType.Discrete;
-                            return;
+                            hasNvidia = true;
                         }
-
-                        // Intel is always integrated
-                        if (name.Contains("intel") && (name.Contains("hd graphics") ||
-                            name.Contains("uhd graphics") || name.Contains("iris") ||
-                            name.Contains("arc")))
+                        else if (name.Contains("amd") || name.Contains("radeon") ||
+                                 name.Contains("rx"))
                         {
-                            gpuType = GpuType.Integrated;
-                            return;
-                        }
-
-                        // AMD: check VRAM size — dGPU typically has > 512MB dedicated
-                        if (name.Contains("amd") || name.Contains("radeon"))
-                        {
+                            object ramObj = obj["AdapterRAM"];
                             if (ramObj != null)
                             {
-                                long ramBytes = Convert.ToInt64(ramObj);
-                                if (ramBytes > 536870912) // > 512 MB
-                                {
-                                    gpuType = GpuType.Discrete;
-                                }
-                                else
-                                {
-                                    gpuType = GpuType.Integrated;
-                                }
-                                return;
+                                long ram = Convert.ToInt64(ramObj);
+                                if (ram > amdMaxVRAM) amdMaxVRAM = ram;
                             }
                         }
+                        else if (name.Contains("intel") &&
+                            (name.Contains("hd") || name.Contains("uhd") ||
+                             name.Contains("iris") || name.Contains("arc")))
+                        {
+                            hasIntel = true;
+                        }
                     }
+                }
+
+                // Decision: NVIDIA always discrete
+                if (hasNvidia)
+                {
+                    gpuType = GpuType.Discrete;
+                    return;
+                }
+
+                // AMD: VRAM size determines type
+                if (amdMaxVRAM > 0)
+                {
+                    gpuType = (amdMaxVRAM >= 536870912) ?
+                        GpuType.Discrete : GpuType.Integrated;
+                    return;
+                }
+
+                // Intel only → integrated
+                if (hasIntel)
+                {
+                    gpuType = GpuType.Integrated;
+                    return;
                 }
             }
             catch { }
@@ -184,24 +202,154 @@ namespace DeepHibernate
             gpuType = GpuType.Unknown;
         }
 
-        // =====================================================
-        // Fan Control Detection
-        // =====================================================
-        private void DetectFanControl()
+        // Gets AdapterRAM (dedicated VRAM) from WMI for a GPU matching the given name.
+        // Returns 0 if the GPU is not found or AdapterRAM is unavailable.
+        private long GetAdapterRAMForGPU(string gpuName)
         {
-            fanControlSupported = false;
-
             try
             {
-                // Try WMI Win32_Fan — most consumer boards don't support write
+                using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
+                    "SELECT Name, AdapterRAM FROM Win32_VideoController"))
+                {
+                    foreach (ManagementObject obj in searcher.Get())
+                    {
+                        string wmiName = (obj["Name"] ?? "").ToString();
+                        // Match by partial name (LHM name is usually a substring of WMI name)
+                        if (wmiName.ToLower().Contains(gpuName.ToLower()) ||
+                            gpuName.ToLower().Contains(wmiName.ToLower()))
+                        {
+                            object ramObj = obj["AdapterRAM"];
+                            if (ramObj != null)
+                            {
+                                return Convert.ToInt64(ramObj);
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            return 0;
+        }
+
+        // =====================================================
+        // Fan Control Helpers
+        // =====================================================
+        private string FindNvidiaSmi()
+        {
+            string[] candidates = new string[] {
+                @"C:\Windows\System32\nvidia-smi.exe",
+                @"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+            };
+            foreach (string path in candidates)
+                if (System.IO.File.Exists(path)) return path;
+            try
+            {
+                Process p = new Process();
+                p.StartInfo.FileName = "where";
+                p.StartInfo.Arguments = "nvidia-smi";
+                p.StartInfo.UseShellExecute = false;
+                p.StartInfo.CreateNoWindow = true;
+                p.StartInfo.RedirectStandardOutput = true;
+                p.Start();
+                string result = p.StandardOutput.ReadLine();
+                p.WaitForExit(3000);
+                if (!string.IsNullOrEmpty(result)) return result.Trim();
+            }
+            catch { }
+            return null;
+        }
+
+        private void SetNvidiaFanSpeed(int percent)
+        {
+            string smiPath = FindNvidiaSmi();
+            if (smiPath == null) return;
+            string arg = percent < 0
+                ? "-i 0 -fan 0:auto"
+                : string.Format("-i 0 -fan 0:{0}", percent);
+            try
+            {
+                Process p = new Process();
+                p.StartInfo.FileName = smiPath;
+                p.StartInfo.Arguments = arg;
+                p.StartInfo.UseShellExecute = false;
+                p.StartInfo.CreateNoWindow = true;
+                p.Start();
+                p.WaitForExit(5000);
+            }
+            catch { }
+        }
+
+        private void SetWMIFanSpeed(int percent)
+        {
+            try
+            {
                 using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
                     @"root\cimv2", "SELECT * FROM Win32_Fan"))
                 {
                     foreach (ManagementObject obj in searcher.Get())
                     {
-                        // Win32_Fan is mostly read-only; check if DesiredSpeed property exists
-                        if (obj.Properties["DesiredSpeed"] != null)
+                        try
                         {
+                            ManagementBaseObject inParams =
+                                obj.GetMethodParameters("SetSpeed");
+                            if (inParams != null)
+                            {
+                                inParams["DesiredSpeed"] = (percent < 0) ? 0 : percent;
+                                obj.InvokeMethod("SetSpeed", inParams, null);
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        // =====================================================
+        // Fan Control Detection (Multi-fallback)
+        // =====================================================
+        private void DetectFanControl()
+        {
+            fanMethod = FanControlMethod.None;
+            fanControlSupported = false;
+
+            // Priority 1: nvidia-smi GPU fan control
+            try
+            {
+                string smiPath = FindNvidiaSmi();
+                if (smiPath != null)
+                {
+                    Process p = new Process();
+                    p.StartInfo.FileName = smiPath;
+                    p.StartInfo.Arguments = "-i 0 --query-gpu=fan.speed --format=csv,noheader,nounits";
+                    p.StartInfo.UseShellExecute = false;
+                    p.StartInfo.CreateNoWindow = true;
+                    p.StartInfo.RedirectStandardOutput = true;
+                    p.Start();
+                    string output = p.StandardOutput.ReadToEnd().Trim();
+                    p.WaitForExit(3000);
+                    if (p.ExitCode == 0 && !string.IsNullOrEmpty(output) && output != "[Not Supported]")
+                    {
+                        fanMethod = FanControlMethod.NvidiaSMI;
+                        fanControlSupported = true;
+                        return;
+                    }
+                }
+            }
+            catch { }
+
+            // Priority 2: WMI Win32_Fan SetSpeed
+            try
+            {
+                using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
+                    @"root\cimv2", "SELECT * FROM Win32_Fan"))
+                {
+                    foreach (ManagementObject obj in searcher.Get())
+                    {
+                        ManagementBaseObject inParams = obj.GetMethodParameters("SetSpeed");
+                        if (inParams != null)
+                        {
+                            fanMethod = FanControlMethod.WMI;
                             fanControlSupported = true;
                             return;
                         }
@@ -209,31 +357,6 @@ namespace DeepHibernate
                 }
             }
             catch { }
-
-            try
-            {
-                // Try LHM fan control sensors
-                if (lhmAvailable && lhmComputer != null)
-                {
-                    foreach (var hardware in lhmComputer.Hardware)
-                    {
-                        try { hardware.Update(); } catch { continue; }
-
-                        foreach (var sensor in hardware.Sensors)
-                        {
-                            if (sensor.SensorType == SensorType.Control &&
-                                sensor.Name.ToLower().Contains("fan"))
-                            {
-                                fanControlSupported = true;
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-            catch { }
-
-            fanControlSupported = false;
         }
 
         // =====================================================
@@ -245,25 +368,16 @@ namespace DeepHibernate
 
             try
             {
-                // Attempt via WMI
-                using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
-                    @"root\cimv2", "SELECT * FROM Win32_Fan"))
+                switch (fanMethod)
                 {
-                    foreach (ManagementObject obj in searcher.Get())
-                    {
-                        try
-                        {
-                            ManagementBaseObject inParams =
-                                obj.GetMethodParameters("SetSpeed");
-                            if (inParams != null)
-                            {
-                                inParams["DesiredSpeed"] = 100;
-                                obj.InvokeMethod("SetSpeed", inParams, null);
-                                fanBoosted = true;
-                            }
-                        }
-                        catch { }
-                    }
+                    case FanControlMethod.NvidiaSMI:
+                        SetNvidiaFanSpeed(100);
+                        fanBoosted = true;
+                        break;
+                    case FanControlMethod.WMI:
+                        SetWMIFanSpeed(100);
+                        fanBoosted = true;
+                        break;
                 }
             }
             catch { }
@@ -275,23 +389,14 @@ namespace DeepHibernate
 
             try
             {
-                using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
-                    @"root\cimv2", "SELECT * FROM Win32_Fan"))
+                switch (fanMethod)
                 {
-                    foreach (ManagementObject obj in searcher.Get())
-                    {
-                        try
-                        {
-                            ManagementBaseObject inParams =
-                                obj.GetMethodParameters("SetSpeed");
-                            if (inParams != null)
-                            {
-                                inParams["DesiredSpeed"] = 0; // 0 = auto / default
-                                obj.InvokeMethod("SetSpeed", inParams, null);
-                            }
-                        }
-                        catch { }
-                    }
+                    case FanControlMethod.NvidiaSMI:
+                        SetNvidiaFanSpeed(-1);
+                        break;
+                    case FanControlMethod.WMI:
+                        SetWMIFanSpeed(-1);
+                        break;
                 }
                 fanBoosted = false;
             }
@@ -476,7 +581,7 @@ namespace DeepHibernate
 
             // Version
             Label lblVersion = new Label();
-            lblVersion.Text = "v2.2";
+            lblVersion.Text = "v2.3";
             lblVersion.Font = new Font("Microsoft YaHei", 8);
             lblVersion.ForeColor = Color.LightGray;
             lblVersion.Location = new Point(leftMargin, y);
@@ -553,17 +658,18 @@ namespace DeepHibernate
             SetFanSpeedMax();
 
             string gpuLabel = GetGpuTypeLabel();
+            string perfNote = fanControlSupported ? "" : " [已切换高性能模式加速散热]";
             if (gpuType == GpuType.Integrated)
             {
                 lblStatus.Text = string.Format(
-                    "正在降温 [{0}]... 等待 GPU 温度降至 {1}°C",
-                    gpuLabel, targetTemp);
+                    "正在降温 [{0}]... 等待 GPU 温度降至 {1}°C{2}",
+                    gpuLabel, targetTemp, perfNote);
             }
             else
             {
                 lblStatus.Text = string.Format(
-                    "正在降温 [{0}]... 等待 CPU + GPU 温度降至 {1}°C",
-                    gpuLabel, targetTemp);
+                    "正在降温 [{0}]... 等待 CPU + GPU 温度降至 {1}°C{2}",
+                    gpuLabel, targetTemp, perfNote);
             }
             lblStatus.ForeColor = Color.FromArgb(220, 120, 0);
 
@@ -705,12 +811,18 @@ namespace DeepHibernate
         {
             if (fanControlSupported)
             {
-                lblFanStatus.Text = "风扇控制：已就绪，降温时将自动拉高转速";
+                string methodLabel = "就绪";
+                switch (fanMethod)
+                {
+                    case FanControlMethod.NvidiaSMI: methodLabel = "nvidia-smi"; break;
+                    case FanControlMethod.WMI: methodLabel = "WMI"; break;
+                }
+                lblFanStatus.Text = string.Format("风扇控制：{0} — 降温时将自动拉高转速", methodLabel);
                 lblFanStatus.ForeColor = Color.FromArgb(0, 140, 60);
             }
             else
             {
-                lblFanStatus.Text = "风扇控制：不可用（系统不支持软件调速，将依赖被动降温）";
+                lblFanStatus.Text = "风扇控制：不可用 — 将切换高性能电源方案加速散热";
                 lblFanStatus.ForeColor = Color.FromArgb(180, 120, 0);
             }
         }
@@ -793,7 +905,8 @@ namespace DeepHibernate
             int sec = elapsedSec % 60;
 
             string gpuLabel = GetGpuTypeLabel();
-            string fanNote = fanBoosted ? " [风扇加速]" : "";
+            string fanNote = fanBoosted ? " [风扇加速]"
+                : (fanControlSupported ? "" : " [高性能模式]");
 
             lblStatus.Text = string.Format(
                 "降温中 [{0}:{1:D2}] — 目标 {2}°C [{3}]{4}",

@@ -1,5 +1,26 @@
 # DeepHibernate 更新日志
 
+## v2.3 (2026-07-16) — 风扇控制多路回退 + GPU 检测修复
+
+### 风扇控制
+- **nvidia-smi**：NVIDIA GPU 风扇直接调速（`-fan 0:100` 拉满 / `-fan 0:auto` 恢复）
+- **LibreHardwareMonitorLib IControl**：通过 LHM Control 接口设置风扇转速
+- **WMI Win32_Fan SetSpeed**：系统风扇兜底调速
+- **高性能电源方案兜底**：以上均不可用时自动切换高性能模式 + UI 提示
+
+### GPU 类型检测修复
+- LHM sensor 类型优先判断（NvidiaGpu / AmdGpu / IntelGpu）
+- AMD 交叉验证 WMI AdapterRAM（≥512MB 为独显，否则核显）
+- WMI 兜底：AdapterRAM < 512MB 或 Name 不含 NVIDIA/GeForce/RTX/GTX/RX → 核显
+- 修复 Intel + AMD 双显卡场景的检测优先级
+
+### 休眠逻辑
+- 核显：仅 GPU 温度达标即休眠
+- 独显：CPU + GPU 温度均达标才休眠
+- 未知 GPU：回退 CPU 单条件判断
+
+---
+
 ## v2.0 (2026-07-15) — 重新编译
 
 ### v2.0 经典 UI + 新特性
